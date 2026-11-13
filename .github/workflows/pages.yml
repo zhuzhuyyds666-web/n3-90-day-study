@@ -1,0 +1,160 @@
+name: Publish N3 learning room
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/pages.yml, index.html, studio.css, studio.js, plan.xlsx, course.json, available.json, 'Day*.json']
+  workflow_dispatch:
+  schedule:
+    - cron: '13,47 6 * * *'
+      timezone: Asia/Shanghai
+    - cron: '17 7,8,9,12,18 * * *'
+      timezone: Asia/Shanghai
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: n3-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Synchronize complete study packs
+        id: sync
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import datetime, timedelta
+          from io import BytesIO
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+          from urllib.request import urlopen
+          from zipfile import BadZipFile, ZipFile
+          from zoneinfo import ZoneInfo
+
+          source = 'https://n3-90-day-study.zhoujinhangz.chatgpt.site'
+          pages = 'https://zhuzhuyyds666-web.github.io/n3-90-day-study/'
+          base = ('index.html', 'studio.css', 'studio.js', 'plan.xlsx', 'course.json')
+          filenames = ('01_今日讲解.docx', '02_练习与答案.docx', '03_单词卡.xlsx',
+                       '04_听力材料.docx', '05_昨日复习.docx')
+          manifest = Path('available.json')
+          course = json.loads(Path('course.json').read_text(encoding='utf-8'))
+          plan = {day['id']: day for day in course['plan']}
+          ready = set(json.loads(manifest.read_text(encoding='utf-8'))['ready'])
+          if len(plan) != 90 or course['timezone'] != 'Asia/Shanghai' or not ready <= plan.keys():
+              raise ValueError('Unexpected course plan or release manifest')
+
+          now = datetime.now(ZoneInfo(course['timezone']))
+          automatic = os.environ['EVENT_NAME'] == 'schedule'
+          if automatic and now.date().isoformat() > course['end'] and len(ready) == 90:
+              sys.exit(0)
+
+          def get_json(url):
+              with urlopen(url, timeout=22) as response:
+                  return json.load(response)
+
+          def fetch_pack(lesson_id):
+              pack = get_json(source + '/api/pages/' + lesson_id)
+              lesson, attachments = pack['content'], pack['files']
+              zip_name = lesson_id + '_N3学习包.zip'
+              if lesson['day'] != plan[lesson_id]['day'] or set(attachments) != set((*filenames, zip_name)):
+                  raise ValueError('Unexpected content or file inventory')
+              with ZipFile(BytesIO(base64.b64decode(attachments[zip_name], validate=True))) as archive:
+                  if set(archive.namelist()) != {lesson_id + '/' + name for name in filenames}:
+                      raise ValueError('Unexpected ZIP inventory')
+                  for name in filenames:
+                      contents = base64.b64decode(attachments[name], validate=True)
+                      if contents != archive.read(lesson_id + '/' + name):
+                          raise ValueError('ZIP does not match individual files')
+                      with ZipFile(BytesIO(contents)) as office:
+                          if '[Content_Types].xml' not in office.namelist() or office.testzip():
+                              raise ValueError('Invalid Office file')
+              return pack
+
+          def write_json(path, value):
+              temporary = path.with_suffix('.tmp')
+              temporary.write_text(json.dumps(value, ensure_ascii=False, separators=(',', ':')) + '\n',
+                                   encoding='utf-8')
+              temporary.replace(path)
+
+          changed = False
+          try:
+              upstream = set(get_json(source + '/api/pages/ready')['ready'])
+              if not upstream <= plan.keys():
+                  raise ValueError('Unexpected lesson IDs')
+          except (OSError, ValueError, KeyError) as error:
+              print('Course source unavailable:', error)
+              upstream = set()
+
+          with ThreadPoolExecutor(max_workers=4) as workers:
+              waiting = {day: workers.submit(fetch_pack, day) for day in sorted(upstream - ready)}
+              for lesson_id, future in waiting.items():
+                  try:
+                      pack = future.result()
+                  except (OSError, ValueError, KeyError, BadZipFile) as error:
+                      print(lesson_id, 'will be retried:', error)
+                      continue
+                  write_json(Path(lesson_id + '.json'), pack)
+                  ready.add(lesson_id)
+                  changed = True
+          if changed:
+              write_json(manifest, {'ready': sorted(ready)})
+
+          due = [day['id'] for day in plan.values()
+                 if datetime.fromisoformat(day['opens']) <= now + timedelta(hours=1) and day['id'] not in ready]
+          if due:
+              print('Awaiting complete study packs:', ', '.join(due))
+
+          if automatic and not changed:
+              try:
+                  live = set(get_json(pages + 'available.json?run=' + os.environ['GITHUB_RUN_ID'])['ready'])
+              except (OSError, ValueError, KeyError):
+                  live = set()
+              if live == ready:
+                  print('The website already contains all verified packs.')
+                  sys.exit(0)
+
+          dest = Path('_site')
+          dest.mkdir()
+          for name in (*base, manifest.name, *(day + '.json' for day in sorted(ready))):
+              shutil.copyfile(name, dest / name)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              print('deploy=true', file=output)
+          print('Verified study packs:', ', '.join(sorted(ready)))
+          PY
+      - name: Preserve the verified study packs
+        if: steps.sync.outputs.deploy == 'true'
+        run: |
+          git add -- available.json 'Day[0-9][0-9].json'
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Sync verified N3 lessons'
+            git push origin HEAD:main
+          fi
+      - name: Upload the learning room
+        if: steps.sync.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        if: steps.sync.outputs.deploy == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
