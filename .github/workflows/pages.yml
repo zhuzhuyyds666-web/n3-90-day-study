@@ -47,7 +47,7 @@ jobs:
           from pathlib import Path
           import shutil
           import sys
-          from urllib.request import urlopen
+          from urllib.request import Request, urlopen
           from zipfile import BadZipFile, ZipFile
           from zoneinfo import ZoneInfo
 
@@ -69,7 +69,8 @@ jobs:
               sys.exit(0)
 
           def get_json(url):
-              with urlopen(url, timeout=22) as response:
+              request = Request(url, headers={'User-Agent': 'N3-Learning-Room/1.0', 'Accept': 'application/json'})
+              with urlopen(request, timeout=22) as response:
                   return json.load(response)
 
           def fetch_pack(lesson_id):
